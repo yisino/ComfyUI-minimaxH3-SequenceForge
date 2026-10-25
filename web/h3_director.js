@@ -473,8 +473,9 @@ function toLLMText(text, pool) {
 /** 回（LLM 产出）：`@标注` → `@素材名`，再补一跳**官方标签 → `@素材名`**。
  *
  *  `media` 是本段真正送进模型的图（`collectSegMedia` 的返回），它给出官方标签
- *  `<Picture N>` 的编号口径（帧锚前置 + 参考素材顺延）。**不传 media 时退化成
- *  旧行为**（只译标注、官方 token 原样保留）—— 老调用点/单测不受影响。
+ *  `<Picture N>` 的编号口径（帧锚前置 + 参考素材顺延）。**media 为空时**不再整跳
+ *  跳过，而是交给 `h3_prompts.officialToMarks` 的残留反查兜底（见那里的注释）——
+ *  否则"本段没有 @素材名 → 调度为空 → 官方标签原样落盘"会永远锁死。
  *
  *  为什么必须带 media：模型有时照官方规则把正文写成 `<Picture 1>` 而不是 `@图片1`，
  *  回填只译标注的话，官方标签会原样落盘 —— 提示词框里出现 picture1，
@@ -484,8 +485,12 @@ function fromLLMText(text, pool, media) {
     const HP = window.H3Prompts || {};
     let s = String(text == null ? "" : text);
     if (typeof HP.textToMarks === "function") s = HP.textToMarks(s, pool);
-    if (Array.isArray(media) && media.length && typeof HP.officialToMarks === "function") {
-        s = HP.officialToMarks(s, media, pool);
+    /* media 为空**也要跑**：官方标签的归位还有一条"残留反查"兜底（见
+     * h3_prompts.officialToMarks）。以前这里一卡 `media.length`，本段一旦因为
+     * 正文里没有 @素材名 而调度为空，`<Picture 1>_22_54_01.jpg` 就原样落盘 ——
+     * 之后每次回填都还是它，正文永远修不回来（红框 + 未引用）。 */
+    if (typeof HP.officialToMarks === "function") {
+        s = HP.officialToMarks(s, Array.isArray(media) ? media : [], pool);
     }
     return s;
 }
@@ -676,6 +681,10 @@ function createPromptEditor(opts) {
      * ——同样读 getDs(node).ref_assets，不能用建卡那一刻的快照。
      * （早期版本只传 kind，够挑图标但不够拼缩略图地址。） */
     const infoOf = () => (typeof o.assets === "function" ? o.assets() : (o.assets || {})) || {};
+    /* 素材池原数组（**活的**）。只给「官方标签归位」用：`<Picture 1>_22_54_01.jpg`
+     * 这种半截引用要靠池内引用名反查才能还原（见 h3_prompts.officialToMarks）。
+     * 没传就退化成"不归位"，解析按钮行为与旧版一致。 */
+    const poolOf = () => (typeof o.pool === "function" ? o.pool() : (o.pool || [])) || [];
     const dirOf = () => (typeof o.dir === "function" ? o.dir() : (o.dir || "")) || "";
     /* token 映射：{"<Picture 1>": "素材别名"}。外部 agent / 官方格式的文本里写的是
      * `<Picture N>`，这里把它也渲染成缩略图（序列化时**原样还原** `<Picture N>`），
@@ -1137,16 +1146,39 @@ function createPromptEditor(opts) {
      *
      * 同时收集**认不出的 @名字**返回给调用方提示 —— 复制来的文本里最常见的就是
      * 素材名对不上（改名过 / 没入库），不提示的话用户只会觉得"解析了没反应"。
-     * 返回 {changed, hits, unknown, missing}。 */
+     * 返回 {changed, hits, unknown, missing}。
+     *
+     * ★ 第一跳先做**官方标签归位**（2026-10-25）：外部 agent / LLM 交回来的正文
+     *   常写成 `<Picture 1>_22_54_01.jpg`（官方编号 + 半截文件名）。以前这里明确
+     *   "官方标签原样保留"，于是这种半截引用**永远修不回来** —— 正文里没有
+     *   `@素材名`，`refsFromText` 扫不到 → 本段未引用 → 图不挂，后缀还挂在
+     *   红框后面（"复制项目后参考素材后缀溢出、没能正确参考上"）。
+     *   现在走与 AI 回填**同一个函数**（h3_prompts.officialToMarks）：能唯一定位
+     *   到池内素材的（含靠残留文件名反查）就地还原成 `@全名`，并把残留一起吃掉；
+     *   定位不到的原样留红框。 */
     function resolveRefs() {
-        const text = api.value;
+        let text = api.value;
+        let tokens = 0;
+        try {
+            const HP = _HP();
+            if (typeof HP.officialToMarks === "function") {
+                const fixed = HP.officialToMarks(text, [], poolOf());
+                if (fixed !== text) {
+                    tokens = (String(text).match(/<(?:Picture|Video|Audio)\s+\d+>/g) || []).length
+                        - (fixed.match(/<(?:Picture|Video|Audio)\s+\d+>/g) || []).length;
+                    text = fixed;
+                }
+            }
+        } catch (e) { /* 归位是增强项：失败也要继续做别名归一 */
+            console.warn("[h3-director] 官方标签归位失败：", e);
+        }
         const labs = [...labelsOf()].sort((a, b) => b.length - a.length);
         const toks = refTokens(text);
         const info = infoOf();
         let out = "", hits = 0;
         for (const t of toks) {
             if (t.text != null) { out += t.text; continue; }
-            /* 官方标签 <Picture N> 原样保留：它是官方格式的一部分，不是导演台语法 */
+            /* 归位之后仍剩下的官方标签：确实是查无此图，原样保留（红框可见） */
             if (t.token) { out += t.token; continue; }
             const canon = String((info[t.label] || {}).ref_name || t.label || "").trim();
             out += "@" + (canon || t.label);
@@ -1162,9 +1194,12 @@ function createPromptEditor(opts) {
             if (labs.some((l) => nm === l || nm.startsWith(l))) continue;
             if (!unknown.includes(nm)) unknown.push(nm);
         }
-        const changed = out !== text;
-        if (changed) api.value = out; else render(text);
-        return { changed, hits, unknown };
+        /* 与**原文**比（不是与归位后的 text 比）：只把官方标签还原成 `@全名`、
+         * 别名一个字都没改时，也必须算"变了"——否则改动不会写回正文，
+         * 用户点了解析却看见红框还在。 */
+        const changed = out !== api.value;
+        if (changed) api.value = out; else render(out);
+        return { changed, hits, unknown, tokens };
     }
 
     /* 失焦/打字停顿后**自动**成框：默认**关闭**。
@@ -2764,6 +2799,9 @@ function adoptManifestPrompts(node, mf) {
     ds.segments = p.segs.length ? p.segs
         : Array.from({ length: ds.prompts.length }, (_v, i) => ds.segments?.[i] ?? defaultSegment());
     ds.inserts = p.inserts;
+    /* 与读档同口径：先归位官方标签残留（`<Picture 1>_xx.jpg` → `@素材名`），
+     * 再按正文派生 refs —— 否则恢复回来的正文看着有引用、实际一个都没挂上。 */
+    fixOfficialTokenRefs(ds);
     /* 正文是引用唯一真相：与读档/贴总提示词同一个函数（绝不另造一套） */
     for (let i = 0; i < ds.prompts.length; i += 1) {
         syncRefsFromText(ds, i, String(ds.prompts[i] ?? ""));
@@ -3827,6 +3865,16 @@ function applyMasterPromptParsed(node, p) {
     /* 引用派生必须在 ds.prompts / ds.segments 都就位之后：refsFromText 按"本段正文
      * 里的 @素材名 出现序列"出结果，与段卡提示词框**逐字同一条函数** —— 这里若另写
      * 一套（旧版的「参考：」标签），就会出现"总提示词框挂上的素材和段卡不是一回事"。 */
+    /* ★ 落库前先做**官方标签归位**（2026-10-25）：外部 agent 交回来的正文几乎都
+     * 用 `<Picture 1>` 指代素材（官方格式），有的还和半截文件名粘在一起
+     * （`<Picture 1>_22_54_01.jpg`）。直接落地的话 `refsFromText` 一个都扫不到，
+     * 结果是「正文看着有引用、本段未引用、图不挂」+ 红框后面挂个裸后缀。
+     * 与 AI 回填共用 h3_prompts.officialToMarks（能唯一定位才还原，否则留红框）。 */
+    const HPm = (typeof window !== "undefined" && window.H3Prompts) || {};
+    if (typeof HPm.officialToMarks === "function") {
+        const poolNow = Array.isArray(ds.ref_assets) ? ds.ref_assets : [];
+        ds.prompts = ds.prompts.map((t) => HPm.officialToMarks(String(t ?? ""), [], poolNow));
+    }
     for (let i = 0; i < ds.prompts.length; i++) {
         syncRefsFromText(ds, i, String(ds.prompts[i] ?? ""));
     }
@@ -7614,6 +7662,7 @@ async function switchProject(dir) {
     const r = await apiGet(`/h3chain/project?dir=${encodeURIComponent(dir)}`);
     if (stale()) return;
     const mf = r.ok ? (r.data?.manifest || null) : null;
+    let fixNote = "";
     if (mf) {
         /* 提示词/分段字段/插入段的归一只有一份实现（promptsFromManifest）：
          * 「恢复到画布」横幅走的是同一个函数，两处不会漂移。 */
@@ -7630,6 +7679,17 @@ async function switchProject(dir) {
              * 引用栏不换」的偏差。 */
             ds.ref_assets = poolFromManifest(mf, await fetchAssetLinks(dir));
             if (stale()) return;
+            /* 读档/复制项目之后必须做一次旧写法迁移（`@别名` / `@别名.jpg` →
+             * `@全名`）：以前只有 hydratePool 里做，而它一看到"池签名相同"就直接
+             * return —— 而这里刚刚把池设成同一个池，于是这一步**永远不执行**。
+             * 表现就是「复制项目后参考素材后缀溢出、引用对不上」：
+             * 正文里还是 `@别名.jpg`，池里是带后缀的全名，最长前缀只吃掉别名。 */
+            migrateRefsToFullNames(ds, ds.ref_assets);
+            /* 顺带把**官方标签残留**归位（`<Picture 1>_22_54_01.jpg` → `@素材名`）：
+             * 那是 AI 回填 / 外部导入留下的坏正文，不修的话每次切回这个项目都是
+             * 红框 + 本段未引用（图根本挂不上）。只在能**唯一定位**到池内素材时才改
+             * （见 h3_prompts.officialToMarks），改了几处如实报给用户。 */
+            fixNote = fixOfficialTokenRefs(ds);
             // 槽位索引态必须清：重摇标记/二采勾选按槽位存，带到新项目会重做错段
             ds.redo_segs = [];
             if (ds.upscale) ds.upscale.include = [];
@@ -7647,7 +7707,7 @@ async function switchProject(dir) {
         }
         if (stale()) return;
         if (mf) {
-            setLed("idle", `已读档「${mf.title || dir}」（${mf.total ? `${mf.done ?? 0}/${mf.total} 段` : "草稿，未配置段落"}）`);
+            setLed("idle", `已读档「${mf.title || dir}」（${mf.total ? `${mf.done ?? 0}/${mf.total} 段` : "草稿，未配置段落"}）${fixNote}`);
         } else {
             setLed("idle", `已指向 ${dir}`);
         }
@@ -10311,6 +10371,13 @@ function buildCards(data) {
                     if (node) { try { arr = getDs(node).ref_assets; } catch (e) { /* 回落快照 */ } }
                     return refInfoMapOf(arr);
                 },
+                /* 池原数组（活）：只给「解析」按钮把 `<Picture 1>_xx_xx_xx.jpg`
+                 * 这类半截官方标签按残留文件名反查回 `@全名`（见 resolveRefs）。 */
+                pool: () => {
+                    let arr = data.ds.ref_assets;
+                    if (node) { try { arr = getDs(node).ref_assets; } catch (e) { /* 回落快照 */ } }
+                    return arr || [];
+                },
                 /* 官方标签 → 素材别名：{"<Picture 1>": "回廊场景", ...}。
                  * 外部 agent 写的官方格式文本里是 `<Picture N>`，靠它渲染成缩略图，
                  * 让用户直接看见"Picture 几"是哪张图（顺序挂错一眼可见）；
@@ -12491,6 +12558,8 @@ function openMasterPromptModal(prefill) {
         value: prefill ? String(prefill) : "",
         labels: () => refLabelsOf(mpPool()),
         assets: () => refInfoMapOf(mpPool()),
+        /* 池原数组：给「解析引用」做官方标签归位用（与段卡同一套逻辑）。 */
+        pool: () => mpPool(),
         /* 官方标签 <Picture N> 可视化打开：外部 agent / 官方格式的文本里是这种写法，
          * 渲染出来才能一眼看出"Picture 几"指向哪张图（顺序挂错立刻可见）。 */
         tokenMap: () => ({}),
@@ -12804,14 +12873,33 @@ function migrateRefsToFullNames(ds, pool) {
     const fixText = (t) => {
         const s = String(t || "");
         if (!s.includes("@")) return s;
+        /* 紧跟其后的"文件名残留"（`.jpg` / `_22_54_01.jpg`）：旧正文常写成
+         * `@别名.jpg`（stem + 自己补的后缀），只吃掉别名的话会剩 `.jpg` 挂在
+         * 绿框后面 —— 就是那条"后缀溢出"。只在残留确实是全名的尾巴时才吞
+         * （`hit.full.endsWith(tail)`），否则不动，免得把正文吃掉。 */
+        const TAIL_RE = /^([._\-]?[^\s，。；：、,;<>"'`（）()\[\]【】]{0,80}?\.[A-Za-z0-9]{2,5})/;
+        const eatTail = (end, full) => {
+            const tw = TAIL_RE.exec(s.slice(end));
+            return (tw && full.endsWith(tw[1])) ? tw[1].length : 0;
+        };
         let out = "";
         let i = 0;
         while (i < s.length) {
             if (s[i] === "@" && !/[0-9A-Za-z_]/.test(s[i - 1] || "")) {
                 const hitFull = pairs.find((p) => s.startsWith(p.full, i + 1));
-                if (hitFull) { out += `@${hitFull.full}`; i += hitFull.full.length + 1; continue; }
+                if (hitFull) {
+                    const end = i + hitFull.full.length + 1;
+                    out += `@${hitFull.full}`;
+                    i = end + eatTail(end, hitFull.full);
+                    continue;
+                }
                 const hit = pairs.find((p) => s.startsWith(p.label, i + 1));
-                if (hit) { out += `@${hit.full}`; i += hit.label.length + 1; continue; }
+                if (hit) {
+                    const end = i + hit.label.length + 1;
+                    out += `@${hit.full}`;
+                    i = end + eatTail(end, hit.full);
+                    continue;
+                }
             }
             out += s[i];
             i += 1;
@@ -12835,6 +12923,36 @@ function migrateRefsToFullNames(ds, pool) {
     return changed;
 }
 
+/** 读档/复制项目时，把正文里的**官方标签残留**归位成 `@素材名`。
+ *
+ *  形态：`<Picture 1>_22_54_01.jpg` —— AI 回填或外部 agent 导入留下的半截引用。
+ *  这种正文 `refsFromText` 一个都扫不到：本段未引用、图不挂，红框后面还挂个裸后缀
+ *  （用户报的"复制项目后参考素材后缀溢出、没能正确参考上"）。
+ *
+ *  规则唯一在 `h3_prompts.officialToMarks`（与 AI 回填同一函数）：media 为空时靠
+ *  残留文件名在池内**唯一反查**，查不到/有歧义就原样留着（红框可见，绝不猜错素材）。
+ *  返回一句给 LED 的说明（没改动返回空串）。
+ */
+function fixOfficialTokenRefs(ds) {
+    if (!ds || !Array.isArray(ds.prompts)) return "";
+    const HPm = (typeof window !== "undefined" && window.H3Prompts) || {};
+    if (typeof HPm.officialToMarks !== "function") return "";
+    const pool = Array.isArray(ds.ref_assets) ? ds.ref_assets : [];
+    let n = 0;
+    let segs = 0;
+    ds.prompts = ds.prompts.map((t) => {
+        const before = String(t ?? "");
+        if (!/<(?:Picture|Video|Audio)\s+\d+>/.test(before)) return before;
+        const after = HPm.officialToMarks(before, [], pool);
+        if (after === before) return before;
+        n += (before.match(/<(?:Picture|Video|Audio)\s+\d+>/g) || []).length
+            - (after.match(/<(?:Picture|Video|Audio)\s+\d+>/g) || []).length;
+        segs += 1;
+        return after;
+    });
+    return segs ? ` · 修复了 ${segs} 段的官方标签引用（${n} 处 <Picture N> → @素材名）` : "";
+}
+
 async function hydratePool(force) {
     const node = findNode();
     if (!node) return;
@@ -12855,7 +12973,14 @@ async function hydratePool(force) {
     _poolDir = dir;
     _poolRev = rev;
     const ds = getDs(node);
-    if (poolSig(ds.ref_assets) === sig) return;
+    /* 池签名相同**不等于**正文已经对齐：读档/复制项目会先把池设成这个池，
+     * 然后走到这里 —— 一跳过就把「旧写法迁到全名」整步漏掉了（复制项目后
+     * `@别名.jpg` 留在正文里，后缀溢出且引用对不上）。所以这里只跳过"写池"，
+     * 迁移照样跑。 */
+    if (poolSig(ds.ref_assets) === sig) {
+        if (migrateRefsToFullNames(ds, pool)) setDs(node, ds);
+        return;
+    }
     ds.ref_assets = pool;
     /* 池子刚换过：顺带把正文里旧写法 `@别名` 迁到 `@全名`（只动 widget） */
     migrateRefsToFullNames(ds, pool);

@@ -102,4 +102,35 @@ eq(HP.officialToMarks("<Picture 1>", media, []), "<Picture 1>", "官方回填：
 eq(HP.officialToMarks(HP.textToMarks("<Picture 1> 与 @图片2", pool), media, pool),
     "@阿依 与 @阿依的家", "官方回填：与 textToMarks 串联（模拟 fromLLMText）");
 
+/* ⑦ 残留反查（2026-10-25）：外部 agent / LLM 把官方标签和半截文件名粘在一起。
+ *
+ * 现场形态：`in <Picture 1>_22_54_01.jpg-derived content` —— 编号 + 文件名尾巴。
+ * 这种正文 `refsFromText` 一个都扫不到：本段未引用、图不挂，红框后面还挂个裸后缀
+ * （用户报的"复制项目后参考素材后缀溢出、没能正确参考上"）。
+ * 判据**只认唯一解**：残留必须恰好是一条池内引用名的结尾，否则原样留红框。 */
+const longPool = [
+    { label: "ChatGPT_Image_2026年8月7日", mark: "图片2",
+      ref_name: "ChatGPT_Image_2026年8月7日_22_54_01.jpg" },
+    { label: "女仆", mark: "图片1", ref_name: "女仆.png" },
+];
+eq(HP.officialToMarks('in <Picture 1>_22_54_01.jpg-derived content', [], longPool),
+    "in @ChatGPT_Image_2026年8月7日_22_54_01.jpg-derived content",
+    "残留反查：无 media 也能靠半截文件名还原，并把残留吃掉");
+eq(HP.officialToMarks('"<Picture 1>_22_54_01.jpg"', [], longPool),
+    '"@ChatGPT_Image_2026年8月7日_22_54_01.jpg"',
+    "残留反查：引号内同样成立");
+eq(HP.officialToMarks("<Picture 1> is a cat. Then", [], longPool),
+    "<Picture 1> is a cat. Then",
+    "残留反查：散文里的句号不当文件名（不误吞）");
+eq(HP.officialToMarks("<Picture 1>_22_54_01.jpg", [], [
+    { label: "a", ref_name: "x_22_54_01.jpg" },
+    { label: "b", ref_name: "y_22_54_01.jpg" },
+]), "<Picture 1>_22_54_01.jpg", "残留反查：两条都以其结尾时不猜");
+eq(HP.officialToMarks("<Picture 1>_22_54_01.jpg", [], []), "<Picture 1>_22_54_01.jpg",
+    "残留反查：空池原样");
+/* media 能给答案时优先 media（编号口径是实跑挂载序，比残留更权威）；
+ * 残留只在**名字本身以它结尾**时才吃掉（`@阿依` 与 `_22_54_01.jpg` 无关，留着） */
+eq(HP.officialToMarks("<Picture 1>_22_54_01.jpg", media, longPool),
+    "@女仆.png_22_54_01.jpg", "残留反查：media 命中优先，不再靠尾巴猜");
+
 process.exit(fails ? 1 : 0);

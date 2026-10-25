@@ -186,20 +186,33 @@
    * `<Subject N>` **不在此列**：它是"可复用可见内容"的抽象标签（角色/场景/风格），
    * 不是素材引用，编号也由模型自行定义（与 media 顺序无对应关系）—— 保留给 H3
    * 模型读，执行期直通。
+   *
+   * ★ **media 为空 / 编号对不上时还有一条兜底：残留反查**（2026-10-25）。
+   *   外部 agent 与 LLM 常把官方标签和文件名拼在一起写：
+   *     `in <Picture 1>_22_54_01.jpg-derived content`
+   *   这一跳若直接放弃，正文就永远修不回来 —— `refsFromText` 只认 `@素材名`，
+   *   于是「红框 + 本段未引用」，图根本挂不上（用户报的"复制项目后后缀溢出、
+   *   没能正确参考上"）。
+   *   兜底规则**只认唯一解**：把标签后面紧跟的那段"以扩展名结尾"的残留
+   *   （`_22_54_01.jpg`）拿去跟池内**引用名**比对，恰好**一条**以它结尾才归位，
+   *   并把这截残留一起吃掉；候选有零条或两条以上就原样保留（宁可显红框让人看见，
+   *   也绝不猜错素材）。零编号歧义、零误吞散文。
    */
   function officialToMarks(text, media, pool) {
     const s = String(text == null ? "" : text);
-    if (!s || !Array.isArray(media) || !media.length) return s;
-    if (!/<(?:Picture|Video|Audio)\s+\d+>/.test(s)) return s;
+    if (!s || !/<(?:Picture|Video|Audio)\s+\d+>/.test(s)) return s;
+    const hasMedia = Array.isArray(media) && media.length > 0;
     /* 标注 -> 素材名（全名优先；同一标注只认第一个，与 markPairs 同口径） */
     const nameOf = {};
+    const poolNames = [];
     for (const a of (pool || [])) {
       const mk = cleanMark(a && a.mark);
       const nm = String((a && (a.ref_name || a.label || a.alias)) || "").trim();
       if (mk && nm && !nameOf[mk]) nameOf[mk] = nm;
+      if (nm && !poolNames.includes(nm)) poolNames.push(nm);
     }
     const seq = { Picture: [], Video: [], Audio: [] };
-    for (const m of media) {
+    for (const m of (hasMedia ? media : [])) {
       const k = String((m && m.kind) || "image").toLowerCase();
       const tag = k === "video" ? "Video" : (k === "audio" ? "Audio" : "Picture");
       const lbl = String((m && m.label) || "").trim();
@@ -208,10 +221,40 @@
        * （帧锚无标注的情形）才直接采用。 */
       seq[tag].push(nameOf[lbl] || (cleanMark(lbl) ? "" : lbl));
     }
-    return s.replace(/<(Picture|Video|Audio)\s+(\d+)>/g, (full, tag, num) => {
-      const nm = seq[tag][Number(num) - 1];
-      return nm ? "@" + nm : full;
-    });
+    /* 残留片段：从标签后紧跟的位置起、直到「.扩展名」为止。开头的 `.`/`_`/`-`
+     * 单独放开，`.jpg` 这种"只有扩展名"的残留也要能命中（`@别名.jpg` 的经典形态）。
+     * 正常散文（`<Picture 1> is a cat.`）开头是空格 → 不命中。 */
+    const TAIL_RE = /^([._\-]?[^\s，。；：、,;<>"'`（）()\[\]【】]{0,80}?\.[A-Za-z0-9]{2,5})/;
+    const pickByTail = (tail) => {
+      const t = String(tail || "").trim();
+      if (!t || t.length < 4) return "";
+      const hits = [...new Set(poolNames.filter((nm) => nm === t || nm.endsWith(t)))];
+      return hits.length === 1 ? hits[0] : "";
+    };
+    let out = "";
+    let i = 0;
+    while (i < s.length) {
+      if (s[i] === "<") {
+        const mt = /^<(Picture|Video|Audio)\s+(\d+)>/.exec(s.slice(i));
+        if (mt) {
+          const nm = (seq[mt[1]] || [])[Number(mt[2]) - 1];
+          if (nm) {
+            const tw = TAIL_RE.exec(s.slice(i + mt[0].length));
+            const eat = (tw && nm.endsWith(tw[1])) ? tw[1].length : 0;
+            out += "@" + nm;
+            i += mt[0].length + eat;
+            continue;
+          }
+          const tw = TAIL_RE.exec(s.slice(i + mt[0].length));
+          const hit = tw ? pickByTail(tw[1]) : "";
+          if (hit) { out += "@" + hit; i += mt[0].length + tw[1].length; continue; }
+          out += mt[0]; i += mt[0].length; continue;
+        }
+      }
+      out += s[i];
+      i += 1;
+    }
+    return out;
   }
 
   /* ---- latent 策略（二采/续接用，随 seg_fields 透存） ---- */

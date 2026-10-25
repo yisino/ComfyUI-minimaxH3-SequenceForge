@@ -83,6 +83,11 @@ const code = [
     extractFn("cleanMark", psrc),
     extractFn("markShaped", psrc),
     extractFn("nextMarkSeq", psrc),
+    extractConstLine("KIND_LIST"),
+    extractConstLine("_HP"),
+    extractFn("refLabelsOf"),
+    extractFn("refInfoMapOf"),
+    extractFn("migrateRefsToFullNames"),
     extractFn("refsFromText"),
     extractFn("createPromptEditor"),
     extractFn("syncRefsFromText"),
@@ -95,6 +100,9 @@ const code = [
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", { pretendToBeVisual: true });
 const { window } = dom;
+/* 线上 h3_prompts.js 与 h3_director.js 一起加载：官方标签归位（resolveRefs → 
+ * officialToMarks）就走 window.H3Prompts。这里照线上装一份，否则那条链测不到。 */
+new Function("window", psrc)(window);
 
 const ds = {
     prompts: ["开头 @阿依 站着"],
@@ -117,7 +125,7 @@ const make = new Function("window", "document", "Event", "alert", "getDs", "setD
     "cancelPromptWrite", "schedulePromptFlush", "scheduleRefresh", "setLed",
     code + "\nreturn { createPromptEditor, canAddRef, addSegmentRef, removeSegmentRef," +
     " applyPromptEdit, syncRefsFromText, refsFromText, refCount," +
-    " KIND_ICON, thumbSig };");
+    " migrateRefsToFullNames, refLabelsOf, refInfoMapOf, KIND_ICON, thumbSig };");
 const M = make(window, window.document, window.Event, alert, getDs, setDs,
     cancelPromptWrite, schedulePromptFlush, scheduleRefresh, setLed);
 
@@ -380,6 +388,62 @@ const ta12 = M.createPromptEditor({
     dir: () => "",
 });
 eq(ta12.el.querySelectorAll(".h3d-rtok-missing").length, 0, "未传 tokenMap：不做未知 @ 检测");
+
+/* ⑰ 解析按钮的官方标签归位（2026-10-25 用户报的"复制项目后后缀溢出、没能正确参考上"）
+ *
+ * 外部 agent / LLM 交回来的正文常写成 `<Picture 1>_22_54_01.jpg`（官方编号 +
+ * 半截文件名）。以前 resolveRefs 明确"官方标签原样保留"，于是这半截引用永远修不
+ * 回来：正文里没有 @素材名 → refsFromText 扫不到 → 本段未引用 → 图不挂。
+ * 现在走 h3_prompts.officialToMarks（与 AI 回填同一函数）靠残留文件名唯一反查。 */
+const fixPool = [
+    { label: "ChatGPT_Image_2026年8月7日", kind: "image", file: "assets/a.jpg",
+      ref_name: "ChatGPT_Image_2026年8月7日_22_54_01.jpg", mark: "图片2" },
+    { label: "女仆", kind: "image", file: "assets/b.png", ref_name: "女仆.png", mark: "图片1" },
+];
+const ta13 = M.createPromptEditor({
+    value: 'in <Picture 1>_22_54_01.jpg-derived content, the source image "<Picture 1>_22_54_01.jpg"',
+    labels: () => M.refLabelsOf(fixPool),
+    assets: () => M.refInfoMapOf(fixPool),
+    pool: () => fixPool,
+    dir: () => "",
+    tokenMap: () => ({}),
+});
+const r13 = ta13.resolveRefs();
+eq(ta13.value,
+    'in @ChatGPT_Image_2026年8月7日_22_54_01.jpg-derived content, the source image "@ChatGPT_Image_2026年8月7日_22_54_01.jpg"',
+    "解析：<Picture N>+残留 → @全名，残留被吃掉（两处都修）");
+ok(r13.changed, "解析：只改官方标签也算 changed（否则改动不写回正文）");
+eq(M.refsFromText(ta13.value, fixPool),
+    ["ChatGPT_Image_2026年8月7日_22_54_01.jpg", "ChatGPT_Image_2026年8月7日_22_54_01.jpg"],
+    "解析：归位后 refsFromText 当场认得出来（两处都算，本段引用不再是空）");
+/* 没有 pool 时不得瞎改（老调用点行为不变） */
+const ta14 = M.createPromptEditor({
+    value: "in <Picture 1>_22_54_01.jpg",
+    labels: () => M.refLabelsOf(fixPool),
+    assets: () => M.refInfoMapOf(fixPool),
+    dir: () => "",
+    tokenMap: () => ({}),
+});
+ta14.resolveRefs();
+eq(ta14.value, "in <Picture 1>_22_54_01.jpg", "解析：未传 pool 时官方标签原样（不猜）");
+
+/* ⑱ 读档/复制项目后的旧写法迁移：`@别名.jpg` → `@全名`，后缀不得溢出
+ *
+ * 复制项目**只**从 manifest 重建池，正文里可能还是旧写法（别名 stem 自己补了后缀）。
+ * 迁移时只吃掉别名、把 `.jpg` 留在正文，就是那条"后缀溢出"；而 hydratePool 以前
+ * 见到"池签名相同"直接 return，切换/复制项目后这一步根本不跑。 */
+const mig = { prompts: ["开头 @ChatGPT_Image_2026年8月7日.jpg 结尾 @女仆.png"], segments: [] };
+eq(M.migrateRefsToFullNames(mig, [
+    { label: "ChatGPT_Image_2026年8月7日", ref_name: "ChatGPT_Image_2026年8月7日_22_54_01.jpg" },
+    { label: "女仆", ref_name: "女仆.png" },
+]), true, "迁移：有改动");
+eq(mig.prompts[0], "开头 @ChatGPT_Image_2026年8月7日_22_54_01.jpg 结尾 @女仆.png",
+    "迁移：别名+自己补的后缀 → 全名，且不重复叠后缀");
+const mig2 = { prompts: ["@ChatGPT_Image_2026年8月7日_22_54_01.jpg.jpg"], segments: [] };
+M.migrateRefsToFullNames(mig2, [
+    { label: "ChatGPT_Image_2026年8月7日", ref_name: "ChatGPT_Image_2026年8月7日_22_54_01.jpg" },
+]);
+eq(mig2.prompts[0], "@ChatGPT_Image_2026年8月7日_22_54_01.jpg", "迁移：双后缀只留一个");
 
 if (fails.length) {
     console.error("FAIL:\n - " + fails.join("\n - "));
